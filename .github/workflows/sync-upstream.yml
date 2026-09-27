@@ -1,0 +1,96 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天 UTC 00:00 自动同步
+  workflow_dispatch:
+    inputs:
+      upstream_url:
+        description: '上游仓库地址（作者换仓库时填写新地址，留空用默认）'
+        required: false
+        default: ''
+      upstream_branch:
+        description: '上游分支名'
+        required: false
+        default: 'main'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine upstream
+        id: upstream
+        run: |
+          DEFAULT_URL="https://github.com/AlephAITech/moyuxl-ecom-image-prompt.git"
+          URL="${{ github.event.inputs.upstream_url }}"
+          if [ -z "$URL" ]; then URL="$DEFAULT_URL"; fi
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "branch=${{ github.event.inputs.upstream_branch }}" >> $GITHUB_OUTPUT
+          echo "Upstream: $URL (branch: ${{ github.event.inputs.upstream_branch }})"
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git remote add upstream "${{ steps.upstream.outputs.url }}" || git remote set-url upstream "${{ steps.upstream.outputs.url }}"
+          if git fetch upstream "${{ steps.upstream.outputs.branch }}" 2>&1; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "::warning::无法从上游仓库获取更新。如果作者已更换仓库地址，请手动触发本工作流并在 upstream_url 中填入新地址。"
+          fi
+
+      - name: Merge upstream
+        if: steps.fetch.outputs.status == 'success'
+        id: merge
+        run: |
+          if git merge "upstream/${{ steps.upstream.outputs.branch }}" --no-edit 2>&1; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+          else
+            echo "status=conflict" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push (clean merge)
+        if: steps.merge.outputs.status == 'clean'
+        run: |
+          if git log HEAD..origin/main --oneline | grep -q .; then
+            echo "本地有未推送的提交，跳过直接 push"
+          else
+            git push origin main
+            echo "已同步上游更新"
+          fi
+
+      - name: Create PR (conflict)
+        if: steps.merge.outputs.status == 'conflict'
+        run: |
+          git checkout -b upstream-sync-conflict
+          git add -A
+          git commit -m "chore: upstream sync with conflicts" || echo "无新提交"
+          git push origin upstream-sync-conflict --force
+          gh pr create \
+            --title "Upstream sync (needs conflict resolution)" \
+            --body "自动同步上游仓库时产生冲突，请手动解决后合并。\n\n上游地址: \`${{ steps.upstream.outputs.url }}\`\n上游分支: \`${{ steps.upstream.outputs.branch }}\`" \
+            --base main \
+            --head upstream-sync-conflict || echo "PR 可能已存在"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## 同步结果" >> $GITHUB_STEP_SUMMARY
+          echo "- 上游地址: \`${{ steps.upstream.outputs.url }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 上游分支: \`${{ steps.upstream.outputs.branch }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Fetch 状态: ${{ steps.fetch.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Merge 状态: ${{ steps.merge.outputs.status }}" >> $GITHUB_STEP_SUMMARY
